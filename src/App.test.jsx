@@ -2,8 +2,8 @@ import { expect, test } from 'vitest';
 import { render, screen } from '@testing-library/react';
 import App from './App';
 
-test('renders learn react link', () => {
+test('renders the Genesis Edge Node runbook heading', () => {
   render(<App />);
-  const linkElement = screen.getByText(/learn react/i);
-  expect(linkElement).toBeDefined();
+  const heading = screen.getByRole('heading', { level: 1, name: /Genesis Edge Node/i });
+  expect(heading).toBeDefined();
 });
