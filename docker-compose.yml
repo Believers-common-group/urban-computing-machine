@@ -1,0 +1,310 @@
+# =============================================================================
+# Genesis Edge Node — Docker Compose Stack
+# =============================================================================
+# Covers: telemetry, ledger, policy enforcement, identity management,
+#         observability, ingress, security, and lightweight settlement tooling.
+#
+# Usage:
+#   1. Copy .env.example to .env and fill in all CHANGE_ME placeholders.
+#   2. docker compose up -d
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Shared network — all services communicate over this bridge network.
+# ---------------------------------------------------------------------------
+networks:
+  edge-net:
+    driver: bridge
+
+# ---------------------------------------------------------------------------
+# Named volumes for persistent state.
+# ---------------------------------------------------------------------------
+volumes:
+  prometheus-data:
+  grafana-data:
+  loki-data:
+  vault-data:
+  besu-data:
+  dex-data:
+
+services:
+
+  # =========================================================================
+  # INGRESS — Traefik reverse proxy / TLS termination
+  # =========================================================================
+  traefik:
+    image: traefik:v3.0
+    container_name: genesis-traefik
+    restart: unless-stopped
+    command:
+      - "--api.dashboard=true"
+      - "--api.insecure=false"
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.web.http.redirections.entryPoint.to=websecure"
+      - "--entrypoints.web.http.redirections.entryPoint.scheme=https"
+      - "--entrypoints.websecure.address=:443"
+      - "--certificatesresolvers.le.acme.tlschallenge=true"
+      - "--certificatesresolvers.le.acme.email=${ACME_EMAIL}"
+      - "--certificatesresolvers.le.acme.storage=/acme/acme.json"
+      - "--log.level=${TRAEFIK_LOG_LEVEL:-INFO}"
+      - "--accesslog=true"
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock:ro"
+      - "./config/traefik/acme:/acme"
+    networks:
+      - edge-net
+    environment:
+      - ACME_EMAIL=${ACME_EMAIL}
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.dashboard.rule=Host(`traefik.${EDGE_DOMAIN}`)"
+      - "traefik.http.routers.dashboard.entrypoints=websecure"
+      - "traefik.http.routers.dashboard.tls.certresolver=le"
+      - "traefik.http.routers.dashboard.service=api@internal"
+      - "traefik.http.routers.dashboard.middlewares=auth-forward"
+      - "traefik.http.middlewares.auth-forward.forwardauth.address=http://opa:8181/v1/data/ingress/allow"
+
+  # =========================================================================
+  # TELEMETRY — Vector telemetry pipeline (collect → transform → route)
+  # =========================================================================
+  vector:
+    image: timberio/vector:0.38.0-alpine
+    container_name: genesis-vector
+    restart: unless-stopped
+    volumes:
+      - "./config/vector/vector.yaml:/etc/vector/vector.yaml:ro"
+      - "/var/log:/var/log:ro"
+    environment:
+      - VECTOR_LOG=${VECTOR_LOG_LEVEL:-info}
+      - LOKI_URL=http://loki:3100
+      - PROMETHEUS_REMOTE_WRITE_URL=http://prometheus:9090/api/v1/write
+    networks:
+      - edge-net
+    depends_on:
+      - loki
+      - prometheus
+    labels:
+      - "traefik.enable=false"
+
+  # =========================================================================
+  # OBSERVABILITY — Prometheus (metrics), Grafana (dashboards), Loki (logs)
+  # =========================================================================
+  prometheus:
+    image: prom/prometheus:v2.51.2
+    container_name: genesis-prometheus
+    restart: unless-stopped
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=${PROMETHEUS_RETENTION:-15d}"
+      - "--web.console.libraries=/etc/prometheus/console_libraries"
+      - "--web.console.templates=/etc/prometheus/consoles"
+      - "--web.enable-lifecycle"
+      - "--web.enable-remote-write-receiver"
+    volumes:
+      - "./config/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro"
+      - prometheus-data:/prometheus
+    networks:
+      - edge-net
+    labels:
+      - "traefik.enable=false"
+
+  grafana:
+    image: grafana/grafana:10.4.2
+    container_name: genesis-grafana
+    restart: unless-stopped
+    environment:
+      - GF_SECURITY_ADMIN_USER=${GF_ADMIN_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GF_ADMIN_PASSWORD}
+      - GF_SERVER_ROOT_URL=https://grafana.${EDGE_DOMAIN}
+      - GF_AUTH_GENERIC_OAUTH_ENABLED=true
+      - GF_AUTH_GENERIC_OAUTH_NAME=Dex
+      - GF_AUTH_GENERIC_OAUTH_CLIENT_ID=${GRAFANA_OAUTH_CLIENT_ID:-grafana}
+      - GF_AUTH_GENERIC_OAUTH_CLIENT_SECRET=${GRAFANA_OAUTH_CLIENT_SECRET}
+      - GF_AUTH_GENERIC_OAUTH_SCOPES=openid profile email groups
+      - GF_AUTH_GENERIC_OAUTH_AUTH_URL=https://dex.${EDGE_DOMAIN}/auth
+      - GF_AUTH_GENERIC_OAUTH_TOKEN_URL=http://dex:5556/token
+      - GF_AUTH_GENERIC_OAUTH_API_URL=http://dex:5556/userinfo
+      - GF_AUTH_GENERIC_OAUTH_ROLE_ATTRIBUTE_PATH=contains(groups[*], 'admins') && 'Admin' || 'Viewer'
+      - GF_USERS_AUTO_ASSIGN_ORG=true
+      - GF_USERS_AUTO_ASSIGN_ORG_ROLE=Viewer
+      - GF_SECURITY_SECRET_KEY=${GF_SECRET_KEY}
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - "./config/grafana/provisioning:/etc/grafana/provisioning:ro"
+    networks:
+      - edge-net
+    depends_on:
+      - prometheus
+      - loki
+      - dex
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.grafana.rule=Host(`grafana.${EDGE_DOMAIN}`)"
+      - "traefik.http.routers.grafana.entrypoints=websecure"
+      - "traefik.http.routers.grafana.tls.certresolver=le"
+      - "traefik.http.services.grafana.loadbalancer.server.port=3000"
+
+  loki:
+    image: grafana/loki:3.0.0
+    container_name: genesis-loki
+    restart: unless-stopped
+    command: -config.file=/etc/loki/loki.yaml
+    volumes:
+      - "./config/loki/loki.yaml:/etc/loki/loki.yaml:ro"
+      - loki-data:/loki
+    networks:
+      - edge-net
+    labels:
+      - "traefik.enable=false"
+
+  # =========================================================================
+  # SECURITY — HashiCorp Vault (secrets management, PKI, dynamic credentials)
+  # =========================================================================
+  vault:
+    image: hashicorp/vault:1.16
+    container_name: genesis-vault
+    restart: unless-stopped
+    cap_add:
+      - IPC_LOCK
+    environment:
+      - VAULT_ADDR=http://0.0.0.0:8200
+      - VAULT_API_ADDR=http://vault:8200
+      - VAULT_CLUSTER_ADDR=http://vault:8201
+      - VAULT_LOG_LEVEL=${VAULT_LOG_LEVEL:-info}
+      - VAULT_SEAL_TYPE=${VAULT_SEAL_TYPE:-shamir}
+    command: vault server -config=/vault/config/vault.hcl
+    volumes:
+      - vault-data:/vault/data
+      - "./config/vault/vault.hcl:/vault/config/vault.hcl:ro"
+    networks:
+      - edge-net
+    healthcheck:
+      test: ["CMD", "vault", "status", "-address=http://127.0.0.1:8200"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 15s
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.vault.rule=Host(`vault.${EDGE_DOMAIN}`)"
+      - "traefik.http.routers.vault.entrypoints=websecure"
+      - "traefik.http.routers.vault.tls.certresolver=le"
+      - "traefik.http.services.vault.loadbalancer.server.port=8200"
+
+  # =========================================================================
+  # IDENTITY MANAGEMENT — Dex OIDC provider (federated identity)
+  # =========================================================================
+  dex:
+    image: dexidp/dex:v2.39.1
+    container_name: genesis-dex
+    restart: unless-stopped
+    command: dex serve /etc/dex/config.yaml
+    environment:
+      - DEX_ISSUER=https://dex.${EDGE_DOMAIN}
+      - DEX_CLIENT_ID=${DEX_CLIENT_ID:-edge-node}
+      - DEX_CLIENT_SECRET=${DEX_CLIENT_SECRET}
+      - DEX_STORAGE_TYPE=${DEX_STORAGE_TYPE:-sqlite3}
+      - DEX_CONNECTOR_LDAP_HOST=${DEX_LDAP_HOST:-}
+      - DEX_CONNECTOR_LDAP_BIND_DN=${DEX_LDAP_BIND_DN:-}
+      - DEX_CONNECTOR_LDAP_BIND_PW=${DEX_LDAP_BIND_PW:-}
+    volumes:
+      - "./config/dex/config.yaml:/etc/dex/config.yaml:ro"
+      - dex-data:/var/dex
+    networks:
+      - edge-net
+    depends_on:
+      vault:
+        condition: service_healthy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.dex.rule=Host(`dex.${EDGE_DOMAIN}`)"
+      - "traefik.http.routers.dex.entrypoints=websecure"
+      - "traefik.http.routers.dex.tls.certresolver=le"
+      - "traefik.http.services.dex.loadbalancer.server.port=5556"
+
+  # =========================================================================
+  # POLICY ENFORCEMENT — Open Policy Agent (OPA)
+  # =========================================================================
+  opa:
+    image: openpolicyagent/opa:0.64.1
+    container_name: genesis-opa
+    restart: unless-stopped
+    command:
+      - "run"
+      - "--server"
+      - "--addr=0.0.0.0:8181"
+      - "--log-level=${OPA_LOG_LEVEL:-info}"
+      - "--set=decision_logs.console=true"
+      - "/policies"
+    volumes:
+      - "./config/opa/policies:/policies:ro"
+    networks:
+      - edge-net
+    labels:
+      - "traefik.enable=false"
+
+  # =========================================================================
+  # LEDGER — Hyperledger Besu (EVM-compatible permissioned ledger)
+  # =========================================================================
+  besu:
+    image: hyperledger/besu:24.3
+    container_name: genesis-besu
+    restart: unless-stopped
+    environment:
+      - BESU_RPC_HTTP_ENABLED=true
+      - BESU_RPC_HTTP_HOST=0.0.0.0
+      - BESU_RPC_HTTP_PORT=8545
+      - BESU_RPC_HTTP_APIS=ETH,NET,WEB3,ADMIN,TXPOOL
+      - BESU_RPC_HTTP_CORS_ORIGINS=${BESU_RPC_CORS_ORIGINS:-none}
+      - BESU_RPC_WS_ENABLED=true
+      - BESU_RPC_WS_HOST=0.0.0.0
+      - BESU_RPC_WS_PORT=8546
+      - BESU_GRAPHQL_HTTP_ENABLED=false
+      - BESU_NETWORK=${BESU_NETWORK:-dev}
+      - BESU_DATA_PATH=/var/lib/besu
+      - BESU_GENESIS_FILE=/etc/besu/genesis.json
+      - BESU_P2P_HOST=${BESU_P2P_HOST:-0.0.0.0}
+      - BESU_P2P_PORT=${BESU_P2P_PORT:-30303}
+      - BESU_BOOTNODES=${BESU_BOOTNODES:-}
+      - BESU_PERMISSIONS_NODES_CONFIG_FILE_ENABLED=${BESU_PERMISSIONS_ENABLED:-false}
+      - BESU_PERMISSIONS_NODES_CONFIG_FILE=/etc/besu/permissions_config.toml
+      - BESU_MINER_ENABLED=${BESU_MINER_ENABLED:-false}
+      - BESU_MINER_COINBASE=${BESU_MINER_COINBASE:-}
+      - BESU_LOGGING=${BESU_LOG_LEVEL:-INFO}
+    volumes:
+      - besu-data:/var/lib/besu
+      - "./config/besu:/etc/besu:ro"
+    networks:
+      - edge-net
+    labels:
+      - "traefik.enable=false"
+
+  # =========================================================================
+  # SETTLEMENT — Stellar Quickstart (lightweight settlement layer)
+  # =========================================================================
+  settlement:
+    image: stellar/quickstart:v626-b854.1-latest
+    container_name: genesis-settlement
+    restart: unless-stopped
+    environment:
+      - NETWORK=${SETTLEMENT_NETWORK:-testnet}
+      - STELLAR_HORIZON_URL=${STELLAR_HORIZON_URL:-https://horizon-testnet.stellar.org}
+      - STELLAR_NETWORK_PASSPHRASE=${STELLAR_NETWORK_PASSPHRASE:-Test SDF Network ; September 2015}
+      - SETTLEMENT_ACCOUNT_SEED=${SETTLEMENT_ACCOUNT_SEED}
+      - SETTLEMENT_API_KEY=${SETTLEMENT_API_KEY}
+      - LOG_LEVEL=${SETTLEMENT_LOG_LEVEL:-info}
+    networks:
+      - edge-net
+    depends_on:
+      vault:
+        condition: service_healthy
+      opa:
+        condition: service_started
+    labels:
+      - "traefik.enable=false"
