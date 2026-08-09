@@ -1,0 +1,13 @@
+genesis_branch:
+  repository: Believers-common-group/urban-computing-machine
+  role: urban_systems_and_environment_runtime_surface
+  integration_branch: genesis
+  release_branch: main
+  source_authority: Believers-common-group/genesis-stack
+  first_point_of_contact: true
+  production_branch: false
+  workstream_pattern: genesis/<workstream>
+  promotion:
+    requires_validation: true
+    target: main
+  release_rule: Urban-computing changes integrate here before promotion.
